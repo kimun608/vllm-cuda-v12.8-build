@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+# Cheap dependency resolution only. This is NOT a vLLM runtime image.
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /usr/local/bin/uv
+ARG VLLM_VERSION=0.31.0
+ARG TORCH_VERSION=2.13.0
+ARG TORCHVISION_VERSION=0.28.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG TRITON_VERSION=3.7.1
+ARG TORCHCODEC_VERSION=0.14.0
+ARG RUST_VERSION=1.95
+ARG CUDA_BASE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG VLLM_COMMIT=""
+ARG TORCH_COMMIT=""
+ARG TORCHVISION_COMMIT=""
+ARG TORCHAUDIO_COMMIT=""
+ARG VLLM_REQUIRED_EXTENSIONS=_C_stable_libtorch,_moe_C_stable_libtorch
+ENV VLLM_VERSION=${VLLM_VERSION} TORCH_VERSION=${TORCH_VERSION} \
+    TORCHVISION_VERSION=${TORCHVISION_VERSION} TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION} \
+    TRITON_VERSION=${TRITON_VERSION} TORCHCODEC_VERSION=${TORCHCODEC_VERSION} \
+    RUST_VERSION=${RUST_VERSION} CUDA_BASE=${CUDA_BASE} \
+    VLLM_COMMIT=${VLLM_COMMIT} TORCH_COMMIT=${TORCH_COMMIT} \
+    TORCHVISION_COMMIT=${TORCHVISION_COMMIT} TORCHAUDIO_COMMIT=${TORCHAUDIO_COMMIT} \
+    VLLM_REQUIRED_EXTENSIONS=${VLLM_REQUIRED_EXTENSIONS}
+WORKDIR /preflight
+COPY scripts/check-dependencies.py scripts/prepare-cudnn-frontend.py scripts/cu128-constraints.txt ./scripts/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    python scripts/check-dependencies.py --download-source --report /preflight/dependency-preflight.json
+CMD ["cat", "/preflight/dependency-preflight.json"]

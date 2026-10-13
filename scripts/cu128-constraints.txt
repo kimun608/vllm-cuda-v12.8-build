@@ -1,0 +1,10 @@
+# Do not let CUDA-agnostic dependencies silently install the latest CUDA toolkit.
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cuda-nvcc-cu12==12.8.93
+nvidia-cuda-nvrtc-cu12==12.8.93
+nvidia-cuda-cccl-cu12==12.8.90
+cuda-python==12.8.0
+cuda-bindings==12.8.0
+# vLLM 0.31 / FlashInfer 0.7 requires frontend >= 1.29. The real adapted wheel
+# retains the official binaries and selects the CUDA 12 CUTLASS DSL dependency.
+nvidia-cudnn-frontend==1.29.0+cu128

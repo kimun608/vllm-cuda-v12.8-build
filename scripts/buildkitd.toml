@@ -1,0 +1,12 @@
+# Optional isolated builder for long CUDA source builds and retries.
+# Its cache lives in this builder's Docker volume; do not remove that volume.
+[worker.oci]
+  gc = true
+  max-parallelism = 2
+
+# Explicit policy replaces the default short retention for cache mounts.
+[[worker.oci.gcpolicy]]
+  all = true
+  reservedSpace = "120GiB"
+  maxUsedSpace = "120GiB"
+  minFreeSpace = "40GiB"
