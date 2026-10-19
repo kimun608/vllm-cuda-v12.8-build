@@ -20,7 +20,7 @@ import urllib.request
 import zipfile
 
 DEFAULTS = {
-    "VLLM_VERSION": "0.31.0", "TORCH_VERSION": "2.13.0",
+    "VLLM_VERSION": "0.32.0", "TORCH_VERSION": "2.13.0",
     "TORCHVISION_VERSION": "0.28.0", "TORCHAUDIO_VERSION": "2.11.0",
     "TRITON_VERSION": "3.7.1", "TORCHCODEC_VERSION": "0.14.0",
     "RUST_VERSION": "1.95", "CUDA_BASE": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04",

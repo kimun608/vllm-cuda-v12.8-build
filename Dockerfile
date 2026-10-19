@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Wrappers/Compose pass versions.env values. Defaults keep direct docker build usable.
 ARG CUDA_BASE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG VLLM_VERSION=0.31.0
+ARG VLLM_VERSION=0.32.0
 ARG TORCH_VERSION=2.13.0
 ARG TORCHVISION_VERSION=0.28.0
 ARG TORCHAUDIO_VERSION=2.11.0
@@ -159,10 +159,23 @@ COPY --from=vllm-build /wheels/source-patches.json /opt/source-patches.json
 COPY --from=vllm-build /wheels/nvidia-cudnn-frontend-wheel.json /opt/nvidia-cudnn-frontend-wheel.json
 COPY scripts/verify-stack.py /opt/verify-stack.py
 WORKDIR /vllm-workspace
-RUN python /opt/verify-stack.py && uv pip check
+# These repository assets are not included in the vLLM wheel.
+COPY --from=vllm-build /src/vllm/examples ./examples
+COPY --from=vllm-build /src/vllm/benchmarks ./benchmarks
+COPY --from=vllm-build /src/vllm/vllm/collect_env.py ./collect_env.py
+COPY --from=vllm-build /src/vllm/docker/entrypoints/vllm-nonroot-entrypoint.sh /usr/local/bin/vllm-nonroot-entrypoint.sh
+COPY scripts/runtime-requirements.txt scripts/runtime-extra-constraints.txt scripts/install-runtime-extras.sh /opt/
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends libsm6 libxext6 libgl1 libibverbs-dev numactl \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/root/.cache/uv bash /opt/install-runtime-extras.sh
+COPY scripts/install-runtime-gdrcopy.sh /opt/install-runtime-gdrcopy.sh
+RUN bash /opt/install-runtime-gdrcopy.sh
+COPY scripts/verify-runtime-assets.py /opt/verify-runtime-assets.py
+ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 LABEL org.opencontainers.image.title="vLLM ${VLLM_VERSION} custom CUDA 12.8 build" \
       org.opencontainers.image.version="${VLLM_VERSION}+cu128" \
       org.opencontainers.image.ref.name="v${VLLM_VERSION}" \
       org.opencontainers.image.source="https://github.com/vllm-project/vllm"
 EXPOSE 8000
-ENTRYPOINT ["/opt/.venv/bin/vllm", "serve"]
+ENTRYPOINT ["vllm", "serve"]

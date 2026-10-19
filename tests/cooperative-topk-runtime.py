@@ -4,7 +4,7 @@
 Run inside the built image on the H200 server:
     python /tests/cooperative-topk-runtime.py --require-supported --output /results/topk.json
 
-SM12x is skipped: vLLM 0.31.0 excludes that family from this cluster kernel.
+Execution is scoped to SM90; other GPU families are not validated by this test.
 Use --metadata-only to inspect the cases without importing Torch or using a GPU.
 """
 
@@ -19,8 +19,28 @@ import sys
 
 WORKSPACE_BYTES = 1024 * 1024
 REPEATS = 2
-UPSTREAM_VERSION = "0.31.0"
-UPSTREAM_COMMIT = "db9527a46873454610df6dbedf79a36d6bf1a7f6"
+REVIEWED_RELEASES = {
+    "0.31.0": {
+        "commit": "db9527a46873454610df6dbedf79a36d6bf1a7f6",
+        "cuda_source_root": "csrc/libtorch_stable",
+        "upstream_test_sha256": "dd9a6c444b7dfcb8ad3a05b6b867f554e4f029f36d3571d90cc51a4129d66bcf",
+    },
+    "0.32.0": {
+        "commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+        "cuda_source_root": "csrc",
+        "upstream_test_sha256": "5cbbc86284087fdc928b883d749476995a4db94c192a7197f78bf70b1258d1b5",
+    },
+}
+# Hash raw Git blobs, not Windows checkout bytes with possible CRLF conversion.
+# The three kernel files are byte-identical in the two reviewed releases.
+UPSTREAM_KERNEL_HASHES = {
+    "cooperative_topk.cu": "9224b4e281ff5ab91e56701d716f2525799a5e4deb41aa4dff20499dd7daec33",
+    "cooperative_topk.cuh": "fbade41dc89181e661a11c0f1d7946a54bdd08e9792645529bad50e48b1a4d51",
+    "topk_histogram_4096.cuh": "b1c8901d5b580fade9cd57e8d0bd1920c8c36908a8ede174393c20d333231bd3",
+}
+PATCH_ID = "cuda128-cooperative-topk-ptx-wrappers-v1"
+PATCHED_HEADER_SHA256 = "03f880c0374cc7a907d8e188417b1bccd0fe6a5c06ff90563f46e2e3177251e9"
+HELPER_SHA256 = "aee3eec42d39efc72dc6ea31c17f14073d716a4e76de4b965df63bddd1e5cc05"
 OPERATOR = "torch.ops._C.cooperative_topk"
 
 
@@ -65,22 +85,55 @@ def describe_case(case):
 
 def skip_reason(capability):
     major, minor = capability
-    if major == 12:
-        return "vLLM 0.31.0 explicitly excludes SM12x from cooperative TopK"
     if capability == (9, 0):
         return None
     return f"This test is scoped to H200/H100 SM90; SM{major}{minor} is not validated"
 
 
-def validate_source(version, build_info):
-    if version.split("+", 1)[0] != UPSTREAM_VERSION:
+def reviewed_source(version):
+    base_version = version.split("+", 1)[0]
+    if base_version not in REVIEWED_RELEASES:
         raise RuntimeError(
-            f"Only vLLM {UPSTREAM_VERSION} was reviewed; this test must be "
+            f"Only vLLM {', '.join(REVIEWED_RELEASES)} were reviewed; this test must be "
             "reviewed again before running another release"
         )
+    release = REVIEWED_RELEASES[base_version]
+    root = release["cuda_source_root"]
+    hashes = {f"{root}/{name}": value for name, value in UPSTREAM_KERNEL_HASHES.items()}
+    hashes["tests/kernels/test_top_k_per_row.py"] = release["upstream_test_sha256"]
+    return dict(
+        version=base_version, commit=release["commit"], cuda_source_root=root,
+        upstream_file_sha256=hashes,
+        source_references=[
+            f"https://github.com/vllm-project/vllm/blob/{release['commit']}/{path}"
+            for path in hashes
+        ],
+    )
+
+
+def validate_source(version, build_info):
+    reviewed = reviewed_source(version)
     commits = build_info.get("source_commits", {})
-    if "vllm" in commits and commits["vllm"] != UPSTREAM_COMMIT:
-        raise RuntimeError("Image vLLM source commit differs from the reviewed source")
+    if commits.get("vllm") != reviewed["commit"]:
+        raise RuntimeError("Image vLLM source commit is missing or differs from the reviewed source")
+    manifest = build_info.get("source_patches", {})
+    root = reviewed["cuda_source_root"]
+    if "cuda_source_root" in manifest and manifest["cuda_source_root"] != root:
+        raise RuntimeError("Image CUDA source layout differs from the reviewed release")
+    patches = [patch for patch in manifest.get("patches", []) if patch.get("id") == PATCH_ID]
+    if len(patches) != 1:
+        raise RuntimeError("Expected exactly one reviewed CUDA 12.8 cooperative TopK patch record")
+    expected = {
+        "source": f"{root}/cooperative_topk.cuh",
+        "patched_source_sha256": PATCHED_HEADER_SHA256,
+        "helper": "cu128-ptx-compat.cuh",
+        "helper_sha256": HELPER_SHA256,
+        "cuda_range": ">=12.8,<12.9",
+    }
+    for key, value in expected.items():
+        if patches[0].get(key) != value:
+            raise RuntimeError(f"Image cooperative TopK patch {key} differs from the reviewed source")
+    return reviewed
 
 
 def assert_result(torch, logits, lengths, indices, storage, k):
@@ -160,16 +213,10 @@ def main():
         kernel_launch_attempts=0,
         launch_count_definition="kernel_launches counts CUDA-synchronized launches",
         started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-        operator=OPERATOR, reviewed_upstream_version=UPSTREAM_VERSION,
-        reviewed_upstream_commit=UPSTREAM_COMMIT, workspace_bytes=WORKSPACE_BYTES,
+        operator=OPERATOR, workspace_bytes=WORKSPACE_BYTES,
+        reviewed_sources={version: reviewed_source(version) for version in REVIEWED_RELEASES},
         workspace_derivation="rows * max(1024, k) * sizeof(Tie=8); rows<=64, k<=2048",
         required_compute_capability=[9, 0], require_supported=args.require_supported,
-        source_references=[
-            f"https://github.com/vllm-project/vllm/blob/{UPSTREAM_COMMIT}/csrc/libtorch_stable/cooperative_topk.cu",
-            f"https://github.com/vllm-project/vllm/blob/{UPSTREAM_COMMIT}/csrc/libtorch_stable/cooperative_topk.cuh",
-            f"https://github.com/vllm-project/vllm/blob/{UPSTREAM_COMMIT}/csrc/libtorch_stable/topk_histogram_4096.cuh",
-            f"https://github.com/vllm-project/vllm/blob/{UPSTREAM_COMMIT}/tests/kernels/test_top_k_per_row.py",
-        ],
         planned_cases=[describe_case(case) for case in cases()], cases=[],
         checks=["exact Torch score oracle", "unique valid indices", "dirty tails",
                 "short/negative-length padding", "output guards", "reused workspace",
@@ -203,7 +250,13 @@ def main():
                 if torch.version.cuda != "12.8":
                     raise RuntimeError("This regression check requires a CUDA 12.8 Torch build")
                 report["vllm_version"] = importlib.metadata.version("vllm")
-                validate_source(report["vllm_version"], build_info)
+                reviewed = validate_source(report["vllm_version"], build_info)
+                report["reviewed_upstream_version"] = reviewed["version"]
+                report["reviewed_upstream_commit"] = reviewed["commit"]
+                report["reviewed_cuda_source_root"] = reviewed["cuda_source_root"]
+                report["reviewed_upstream_file_sha256"] = reviewed["upstream_file_sha256"]
+                report["source_references"] = reviewed["source_references"]
+                report["image_topk_patch_provenance_checked"] = True
                 importlib.import_module("vllm._C_stable_libtorch")
                 op = torch.ops._C.cooperative_topk
                 report["operator_schema"] = str(op.default._schema)

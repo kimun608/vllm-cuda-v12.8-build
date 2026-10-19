@@ -7,7 +7,7 @@ import re
 
 
 PATCH_ID = "cuda128-cooperative-topk-ptx-wrappers-v1"
-RELATIVE_HEADER = Path("csrc/libtorch_stable/cooperative_topk.cuh")
+CUDA_SOURCE_ROOTS = (Path("csrc/libtorch_stable"), Path("csrc"))
 HELPER_NAME = "cu128-ptx-compat.cuh"
 INCLUDE = f'#include "{HELPER_NAME}"'
 GUARD = "#if CUDART_VERSION >= 12080 && CUDART_VERSION < 12090"
@@ -17,9 +17,28 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def repair_fp4_dependent_type(source, manifest):
+def detect_cuda_source_root(source):
+    """v0.32 moved stable-ABI CUDA files to csrc without changing their ABI."""
+    matches = [root for root in CUDA_SOURCE_ROOTS
+               if (source / root / "cooperative_topk.cuh").is_file()]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one reviewed CUDA source layout "
+            "(csrc/libtorch_stable or csrc); "
+            f"found {[root.as_posix() for root in matches]}. Review this release."
+        )
+    root = matches[0]
+    required = (Path("CMakeLists.txt"), Path("setup.py"),
+                root / "quantization/fp4/nvfp4_quant_kernels.cu")
+    missing = [path.as_posix() for path in required if not (source / path).is_file()]
+    if missing:
+        raise RuntimeError(f"Incomplete CUDA source layout; missing {missing}. Review this release.")
+    return root
+
+
+def repair_fp4_dependent_type(source, manifest, source_root):
     """Keep discarded pack16 member accesses dependent on the kernel template."""
-    relative = Path("csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu")
+    relative = source_root / "quantization/fp4/nvfp4_quant_kernels.cu"
     target = source / relative
     if not target.exists():
         return
@@ -44,7 +63,7 @@ def repair_fp4_dependent_type(source, manifest):
     })
 
 
-def repair_generator_checks(source, manifest):
+def repair_generator_checks(source, manifest, source_root):
     """Build cache survives failed Docker RUNs, generated source files do not."""
     cmake = source / "CMakeLists.txt"
     if not cmake.exists():
@@ -52,12 +71,13 @@ def repair_generator_checks(source, manifest):
     original = cmake.read_text(encoding="utf-8")
     patched = original
     generators = {
-        "MACHETE_GEN_SCRIPT_HASH": "csrc/libtorch_stable/quantization/machete/generated/machete_mm_dispatch.cu",
-        "MARLIN_GEN_SCRIPT_HASH_AND_ARCH": "csrc/libtorch_stable/quantization/marlin/kernel_selector.h",
-        "MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH": "csrc/libtorch_stable/moe/marlin_moe_wna16/kernel_selector.h",
+        "MACHETE_GEN_SCRIPT_HASH": "quantization/machete/generated/machete_mm_dispatch.cu",
+        "MARLIN_GEN_SCRIPT_HASH_AND_ARCH": "quantization/marlin/kernel_selector.h",
+        "MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH": "moe/marlin_moe_wna16/kernel_selector.h",
     }
     guarded = []
     for variable, sentinel in generators.items():
+        sentinel = (source_root / sentinel).as_posix()
         if variable not in original:
             continue
         existing = f"OR NOT $CACHE{{{variable}}} STREQUAL ${{{variable}}})"
@@ -134,10 +154,12 @@ def repair_deepgemm_cuda_gate(source, manifest):
 
 
 def apply(source, report):
-    target = source / RELATIVE_HEADER
-    manifest = {"patches": []}
+    source_root = detect_cuda_source_root(source)
+    relative_header = source_root / "cooperative_topk.cuh"
+    target = source / relative_header
+    manifest = {"cuda_source_root": source_root.as_posix(), "patches": []}
     if not target.exists():
-        manifest["note"] = "This release has no cooperative_topk.cuh; no patch needed."
+        raise RuntimeError(f"Missing {relative_header}; review this release before patching")
     else:
         original = target.read_text(encoding="utf-8")
         substitutions = (
@@ -179,15 +201,15 @@ def apply(source, report):
                 target.write_text(patched, encoding="utf-8", newline="\n")
             manifest["patches"].append({
                 "id": PATCH_ID,
-                "source": RELATIVE_HEADER.as_posix(),
+                "source": relative_header.as_posix(),
                 "patched_source_sha256": digest(target.read_bytes()),
                 "helper": HELPER_NAME,
                 "helper_sha256": digest(helper),
                 "cuda_range": ">=12.8,<12.9",
                 "description": "Emit the original relaxed CTA barrier and shared::cta bulk-copy PTX instructions directly.",
             })
-    repair_generator_checks(source, manifest)
-    repair_fp4_dependent_type(source, manifest)
+    repair_generator_checks(source, manifest, source_root)
+    repair_fp4_dependent_type(source, manifest, source_root)
     repair_deepgemm_cuda_gate(source, manifest)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

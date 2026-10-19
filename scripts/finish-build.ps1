@@ -8,6 +8,7 @@ param(
     [string]$Image,
     [string]$RootPath = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExecutable,
+    [string]$RuntimeAssetsManifest,
     [ValidateRange(1, 65535)][int]$SmokePort = 18030,
     [string]$SmokeModel = 'Qwen/Qwen3-0.6B',
     [string]$SmokeModelPath = '/root/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca'
@@ -59,7 +60,8 @@ if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
 # an obsolete error from its previous attempt.
 foreach ($key in @('status','last_updated_at','completion_error','image_id','image_size_bytes',
                   'image_tar','image_tar_bytes','image_tar_sha256','api_model','api_response',
-                  'validation_gpu','nvfp4_validation')) {
+                  'validation_gpu','nvfp4_validation','runtime_assets_validation',
+                  'runtime_assets_manifest','runtime_assets_manifest_sha256','runtime_assets_validation_report')) {
     $state.PSObject.Properties.Remove($key)
 }
 $initialState = @{
@@ -75,6 +77,8 @@ $initialState = @{
     nvfp4_validation_passed = $false
     api_validation_passed = $false
     export_validation_passed = $false
+    runtime_assets_validation_passed = $false
+    runtime_assets_validation = 'not_requested_no_matching_manifest'
 }
 if (!$state.started_at) { $initialState['started_at'] = (Get-Date).ToString('o') }
 foreach ($key in $initialState.Keys) { $state | Add-Member -NotePropertyName $key -NotePropertyValue $initialState[$key] -Force }
@@ -110,6 +114,25 @@ function Invoke-DockerLog([string[]]$DockerArguments, [string]$LogName) {
     & docker @DockerArguments 2>&1 | Tee-Object -FilePath (Join-Path $evidencePath $LogName) -ErrorAction Stop | Out-Host
     $nativeExitCode = $LASTEXITCODE
     if ($nativeExitCode -ne 0) { throw "Docker command failed (exit $nativeExitCode); see $LogName" }
+}
+
+function Get-RuntimeAssetsManifestInput([string]$Manifest, [bool]$Explicit, [string]$SelectedVersion) {
+    if ($Explicit) {
+        if ([string]::IsNullOrWhiteSpace($Manifest)) { throw 'RuntimeAssetsManifest cannot be empty when explicitly supplied' }
+        $candidate = if ([IO.Path]::IsPathRooted($Manifest)) { $Manifest } else { Join-Path $rootPath $Manifest }
+    } else {
+        $candidate = Join-Path $artifactPath "runtime-assets-manifest-v$SelectedVersion.json"
+    }
+    if (!(Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        if ($Explicit) { throw "Runtime assets manifest does not exist: $candidate" }
+        return $null
+    }
+    $resolved = (Resolve-Path -LiteralPath $candidate).Path
+    # Snapshot the exact validated bytes for the subsequent read-only mount.
+    $bytes = [IO.File]::ReadAllBytes($resolved)
+    $document = [Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xfeff) | ConvertFrom-Json
+    if ($document.vllm_version -cne $SelectedVersion) { throw "Runtime assets manifest vllm_version must match $SelectedVersion" }
+    return [pscustomobject]@{ Path = $resolved; Bytes = $bytes; Metadata = $document }
 }
 
 function Remove-OwnedSmokeContainer([switch]$AllowFailure) {
@@ -226,6 +249,34 @@ public static class VllmCompletionWakeLock {
     if (($frontendRecord | ConvertTo-Json -Depth 20 -Compress) -ne ($buildInfo.cudnn_frontend.wheel_provenance | ConvertTo-Json -Depth 20 -Compress)) { throw 'Embedded frontend wheel records disagree' }
     $frontendText | Set-Content -LiteralPath (Join-Path $evidencePath 'frontend-wheel.json') -Encoding utf8
     $buildInfoText | Set-Content -LiteralPath (Join-Path $evidencePath 'build-info.json') -Encoding utf8
+    $runtimeAssetsInput = Get-RuntimeAssetsManifestInput $RuntimeAssetsManifest $PSBoundParameters.ContainsKey('RuntimeAssetsManifest') $selectedVersion
+    if ($null -ne $runtimeAssetsInput) {
+        if ($runtimeAssetsInput.Metadata.source_commit -and $runtimeAssetsInput.Metadata.source_commit -ne $buildInfo.source_commits.vllm) { throw 'Runtime assets manifest source commit does not match the built image' }
+        $manifestSnapshot = Join-Path $evidencePath 'runtime-assets-manifest.json'
+        [IO.File]::WriteAllBytes($manifestSnapshot, $runtimeAssetsInput.Bytes)
+        $runtimeReportPath = Join-Path $evidencePath 'runtime-assets-validation.json'
+        Set-Phase 'validating_runtime_assets' @{
+            runtime_assets_validation = 'pending'
+            runtime_assets_manifest = $runtimeAssetsInput.Path
+            runtime_assets_manifest_sha256 = (Get-FileHash -LiteralPath $manifestSnapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+            runtime_assets_validation_report = $runtimeReportPath
+        }
+        $runtimeArguments = @(
+            'run','--rm','--network','none','--mount',"type=bind,source=$manifestSnapshot,target=/opt/runtime-assets-manifest.json,readonly",
+            '--entrypoint','/opt/.venv/bin/python',$imageData.Id,'/opt/verify-runtime-assets.py',
+            '--manifest','/opt/runtime-assets-manifest.json','--workspace','/vllm-workspace'
+        )
+        $ErrorActionPreference = 'Continue'
+        $runtimeOutput = & docker @runtimeArguments 2> (Join-Path $evidencePath 'runtime-assets-validation.stderr.log')
+        $runtimeExitCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        $runtimeText = (($runtimeOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+        [IO.File]::WriteAllText($runtimeReportPath, $runtimeText + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        if ($runtimeExitCode -ne 0) { throw "CPU runtime assets validation failed (exit $runtimeExitCode); inspect runtime-assets-validation.json and stderr log" }
+        $runtimeReport = $runtimeText | ConvertFrom-Json
+        if ($runtimeReport.passed -isnot [bool] -or $runtimeReport.passed -ne $true -or $runtimeReport.cpu_only -ne $true -or $runtimeReport.gpu_inference_tested -ne $false) { throw 'Runtime assets report does not confirm successful CPU-only validation' }
+        Set-Phase 'runtime_assets_validated' @{ runtime_assets_validation = 'passed'; runtime_assets_validation_passed = $true }
+    }
     Set-Phase 'validating_gpu' @{ source_commits = $buildInfo.source_commits; patches = $patchIds; gpu_architectures = $buildInfo.gpu_architectures; packages = $buildInfo.packages }
     Invoke-DockerLog @('run','--rm','--gpus','all','--entrypoint','/opt/.venv/bin/python',$imageData.Id,'/opt/verify-stack.py','--gpu') 'gpu-validation.log'
     $gpuProbe = Read-DockerText @('run','--rm','--gpus','all','--entrypoint','/opt/.venv/bin/python',$imageData.Id,'-c',"import json,torch; print(json.dumps(dict(name=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability())))") 'gpu-probe'

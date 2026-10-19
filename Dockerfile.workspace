@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
 # Change only the working directory of a previously validated image.
-ARG BASE_IMAGE=lottecard/vllm-openai:v0.31.0-cu128
+ARG BASE_IMAGE=lottecard/vllm-openai:v0.32.0-cu128
 FROM ${BASE_IMAGE}
 WORKDIR /vllm-workspace

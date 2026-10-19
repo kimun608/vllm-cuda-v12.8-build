@@ -1,0 +1,6 @@
+# Non-CUDA serving extras from vllm/vllm-openai:v0.31.0-cu129.
+# Review these pins together with versions.env when changing the vLLM release.
+accelerate==1.15.0
+modelscope==1.37.1
+timm==1.0.30
+runai-model-streamer[s3,gcs,azure]==0.16.1
