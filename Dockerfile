@@ -172,6 +172,20 @@ RUN --mount=type=cache,target=/root/.cache/uv bash /opt/install-runtime-extras.s
 COPY scripts/install-runtime-gdrcopy.sh /opt/install-runtime-gdrcopy.sh
 RUN bash /opt/install-runtime-gdrcopy.sh
 COPY scripts/verify-runtime-assets.py /opt/verify-runtime-assets.py
+# Runtime-only opt-in. Keep native Torch/vLLM build stages independent of this flag.
+ARG VLLM_CUDA128_GEMM_AUTOTUNE=0
+COPY scripts/patch-small-gemm-autotune-v3.py /opt/patch-small-gemm-autotune-v3.py
+RUN case "${VLLM_CUDA128_GEMM_AUTOTUNE}" in 0|1) ;; *) echo 'VLLM_CUDA128_GEMM_AUTOTUNE must be 0 or 1' >&2; exit 2 ;; esac \
+    && printf '%s  %s\n' 'e8e62249d17b370db42b088caefd2677b78b18247c1dbdf2db97f90ec6d34e2c' /opt/patch-small-gemm-autotune-v3.py | sha256sum --check --status \
+    && if [ "${VLLM_CUDA128_GEMM_AUTOTUNE}" = 1 ]; then \
+        python3 -B -E /opt/patch-small-gemm-autotune-v3.py --mode apply \
+            --compilation-source /opt/.venv/lib/python3.12/site-packages/vllm/config/compilation.py \
+            --compiler-source /opt/.venv/lib/python3.12/site-packages/vllm/compilation/compiler_interface.py \
+            --metadata /opt/small-gemm-autotune-v3-patch.json; \
+    else \
+        python3 -B -E -c 'import hashlib,json,pathlib; h=pathlib.Path("/opt/patch-small-gemm-autotune-v3.py"); pathlib.Path("/opt/small-gemm-autotune-v3-disabled.json").write_text(json.dumps({"patch_id":"lottecard-small-capture-gemm-v3","status":"disabled","build_flag":"VLLM_CUDA128_GEMM_AUTOTUNE","build_flag_value":"0","source_modified":False,"helper_sha256":hashlib.sha256(h.read_bytes()).hexdigest()},indent=2)+"\n",encoding="utf-8")'; \
+    fi
+ENV LOTTECARD_GEMM_AUTOTUNE_SIZES=${VLLM_CUDA128_GEMM_AUTOTUNE}
 ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 LABEL org.opencontainers.image.title="vLLM ${VLLM_VERSION} custom CUDA 12.8 build" \
       org.opencontainers.image.version="${VLLM_VERSION}+cu128" \

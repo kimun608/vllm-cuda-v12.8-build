@@ -65,6 +65,44 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Version 0.32.0 
 
 `-ExecutionPolicy Bypass`는 해당 새 프로세스에만 적용하며 시스템 실행 정책을 바꾸지 않습니다.
 
+## 선택적인 CUDA 12.8 small-size GEMM 이미지
+
+`Dockerfile.optimize-cu128`은 이미 빌드한 CUDA 12.8 이미지에 v3 small-size compiler 정책을 추가하는 선택 경로입니다. `/vllm-workspace`, entrypoint, native 패키지와 기존 `/opt/build-info.json`을 상속합니다. `BASE_IMAGE`에는 선택한 빌더가 접근할 수 있는 이미지를 지정하고 가능하면 검토한 digest로 고정하세요. 출력에는 별도 태그를 사용하여 원본을 보존하세요.
+
+Linux:
+
+```bash
+base_image=lottecard/vllm-openai:v0.32.0-cu128
+image=lottecard/vllm-openai:v0.32.0-cu128-optimized
+docker image inspect "$base_image" --format '{{.Id}}'
+docker build --platform linux/amd64 --file Dockerfile.optimize-cu128 --build-arg "BASE_IMAGE=$base_image" --tag "$image" .
+```
+
+Windows PowerShell(WSL2 Linux 컨테이너):
+
+```powershell
+$BaseImage = 'lottecard/vllm-openai:v0.32.0-cu128'
+$Image = 'lottecard/vllm-openai:v0.32.0-cu128-optimized'
+docker image inspect $BaseImage --format '{{.Id}}'
+docker build --platform linux/amd64 --file Dockerfile.optimize-cu128 --build-arg "BASE_IMAGE=$BaseImage" --tag $Image .
+```
+
+전체 소스 빌드의 `VLLM_CUDA128_GEMM_AUTOTUNE` 기본값도 `0`으로 유지합니다. 명시적으로 켤 때는 Linux에서 `VLLM_CUDA128_GEMM_AUTOTUNE=1 VLLM_IMAGE=lottecard/vllm-openai:v0.32.0-cu128-optimized bash build.sh`, PowerShell에서 `$env:VLLM_CUDA128_GEMM_AUTOTUNE='1'; .\build.ps1 -Image lottecard/vllm-openai:v0.32.0-cu128-optimized`처럼 별도 이미지 이름을 지정하세요. 셸 환경값을 바꾸면 후속 빌드에도 영향을 줄 수 있습니다. overlay는 이 main 빌드 토글과 독립적으로 정책을 켜는 경로입니다.
+
+정책은 `compile_sizes=None`인 자동 vLLM compile/Inductor 설정에서 내부 sentinel을 넣고, 실제 CUDA graph capture size 중 `1..16`만 specialization합니다. 그 범위의 single-size 컴파일에만 local `max_autotune_gemm` 기본값과 `ATEN,TRITON` 후보를 추가합니다. 전역 Torch GEMM/backends 환경 변수는 이미지에 추가하지 않습니다. 큰 범위의 local 옵션 사전은 기존 동작을 유지하지만 높은 동시성 요청도 작은 shape을 실행할 수 있으므로 전체 요청 성능이 같다고 보장하지 않습니다.
+
+명시한 `compile_sizes=[]`·사용자 목록·eager/backend 설정은 자동 size 선택보다 우선합니다. 사용자 목록에 작은 single size가 있으면 flag1의 local GEMM 정책은 적용될 수 있습니다. 기존 compiler 옵션은 `setdefault`로 우선하며 `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0`은 helper의 GEMM opt-in을 막습니다(사용자가 명시한 compiler 옵션 True를 강제로 뒤집지는 않습니다). 자동 설정 guard 안에서만 두 vLLM wide/coordinate tuning 기본값을 `0`으로 설정하고 기존 환경값을 보존합니다. 이 기본값은 프로세스에 남으므로 설정을 바꿀 때 새 프로세스를 사용하세요. flag1은 range별 compiler cache factor에 `(lottecard-small-capture-gemm-v3,16)` marker를 추가하며 flag0은 원래 factor를 유지합니다.
+
+overlay는 helper SHA256 및 설치된 `compilation.py`와 `compiler_interface.py`의 검토한 입력 SHA256을 검사합니다. 중복 패치·다른 hash·지원하지 않는 구조는 빌드에 실패합니다. 다른 버전은 두 소스를 검토하고 `EXPECTED_COMPILATION_SOURCE_SHA256`과 `EXPECTED_COMPILER_SOURCE_SHA256`을 명시적으로 갱신해야 하며 hash 변경만으로 구조 검사를 우회하지 않습니다. main 소스 빌드의 flag1은 두 파일의 구조 검사를 수행하고 입력·출력 hash를 별도 metadata에 기록합니다. flag0은 source 패치를 건너뛰고 `/opt/small-gemm-autotune-v3-disabled.json`에 disabled metadata를 기록합니다. 이 기록은 overlay의 applied metadata 경로와 분리되므로, 두 원본 소스가 검토한 SHA256과 일치하는 flag0 이미지에는 overlay를 적용할 수 있으며 disabled 기록도 보존됩니다. 이미 flag1로 패치한 이미지에는 overlay를 중복 적용하지 않습니다.
+
+overlay의 CPU preflight는 GPU를 초기화하지 않고 Torch CUDA `12.8` 및 두 Triton ptxas 경로의 `release 12.8`을 확인하여 `/opt/small-gemm-base-validation.json`에 기록합니다. 패치 근거는 원래 native provenance와 분리한 `/opt/small-gemm-autotune-v3-patch.json`에 저장합니다.
+
+```console
+docker run --rm --network none --entrypoint cat lottecard/vllm-openai:v0.32.0-cu128-optimized /opt/small-gemm-autotune-v3-patch.json
+```
+
+첫 실행의 컴파일·autotune 비용과 시작 시간은 GPU·모델·shape에 따라 달라지며, `<=16` 제한이 시작 시간의 상한을 뜻하지 않습니다. 재시작 비용을 줄이려면 GPU·이미지·Torch/vLLM·모델별로 구분한 외부 저장소에 `VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`를 보존할 수 있습니다. 모델·compiler cache는 이미지나 Git에 넣지 않습니다. **H200에서 이 정책을 검증하지 않았습니다.** 대상 GPU·모델에서 정확도, 메모리, 시작 시간과 serving 성능을 별도로 확인하세요.
+
 ## 사전 검사와 빌드 자원
 
 래퍼는 `Dockerfile.preflight`에 본 빌드와 같은 버전 설정을 전달합니다. 태그·의존성 검사가 실패하면 무거운 소스 컴파일을 시작하지 않습니다. 사전 검사 통과만으로 CUDA 컴파일이나 추론 성공이 확인되는 것은 아닙니다.

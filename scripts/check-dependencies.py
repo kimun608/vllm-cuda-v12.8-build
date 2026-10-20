@@ -26,6 +26,7 @@ DEFAULTS = {
     "RUST_VERSION": "1.95", "CUDA_BASE": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04",
     "VLLM_COMMIT": "", "TORCH_COMMIT": "", "TORCHVISION_COMMIT": "", "TORCHAUDIO_COMMIT": "",
     "VLLM_REQUIRED_EXTENSIONS": "_C_stable_libtorch,_moe_C_stable_libtorch",
+    "VLLM_CUDA128_GEMM_AUTOTUNE": "0",
 }
 REPOSITORIES = {
     "VLLM": "vllm-project/vllm", "TORCH": "pytorch/pytorch",
@@ -76,6 +77,8 @@ def read_config(path, environ=None):
         raise ValueError("This preflight supports CUDA 12.8 / Ubuntu 24.04 / Python 3.12 only")
     if not all(re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", item.strip()) for item in values["VLLM_REQUIRED_EXTENSIONS"].split(",")):
         raise ValueError("VLLM_REQUIRED_EXTENSIONS must contain comma-separated Python module names")
+    if values["VLLM_CUDA128_GEMM_AUTOTUNE"] not in {"0", "1"}:
+        raise ValueError("VLLM_CUDA128_GEMM_AUTOTUNE must be 0 or 1")
     return values
 
 

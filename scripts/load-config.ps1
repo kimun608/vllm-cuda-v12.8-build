@@ -4,7 +4,7 @@ function Get-VllmBuildKeys {
       'TRITON_VERSION', 'TORCHCODEC_VERSION', 'RUST_VERSION', 'CUDA_BASE',
       'VLLM_COMMIT', 'TORCH_COMMIT', 'TORCHVISION_COMMIT', 'TORCHAUDIO_COMMIT',
       'VLLM_REQUIRED_EXTENSIONS', 'TORCH_CUDA_ARCH_LIST', 'MAX_JOBS',
-      'TORCH_MAX_JOBS', 'VLLM_MAX_JOBS', 'NVCC_THREADS')
+      'TORCH_MAX_JOBS', 'VLLM_MAX_JOBS', 'NVCC_THREADS', 'VLLM_CUDA128_GEMM_AUTOTUNE')
 }
 
 function Read-VllmConfigFile {
@@ -76,6 +76,9 @@ function Get-VllmConfig {
         if ($config[$key] -notmatch '^[1-9][0-9]*$') { throw "$key must be a positive integer" }
         $limit = if ($key -eq 'VLLM_PORT') { 65535 } else { 1024 }
         if ([long]$config[$key] -gt $limit) { throw "$key must not exceed $limit" }
+    }
+    if ($config['VLLM_CUDA128_GEMM_AUTOTUNE'] -cnotmatch '^[01]$') {
+        throw 'VLLM_CUDA128_GEMM_AUTOTUNE must be 0 or 1'
     }
     if ($config['TORCH_CUDA_ARCH_LIST'] -cnotmatch '^\d+\.\d+[a-z]?(?:\+PTX)?(?:;\d+\.\d+[a-z]?(?:\+PTX)?)*$') {
         throw 'TORCH_CUDA_ARCH_LIST must contain semicolon-separated CUDA architectures'
